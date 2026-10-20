@@ -483,14 +483,6 @@ class FeiShuChanel(ChatChannel):
         def start_client_with_retry():
             """Run ws client in this thread with its own event loop to avoid conflicts."""
             import asyncio
-            import ssl as ssl_module
-            original_create_default_context = ssl_module.create_default_context
-
-            def create_unverified_context(*args, **kwargs):
-                context = original_create_default_context(*args, **kwargs)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                return context
 
             # lark_oapi.ws.client keeps its event loop in a module-level global,
             # and Client.start() / _select() / _ping_loop() all reference it. A
@@ -510,11 +502,6 @@ class FeiShuChanel(ChatChannel):
             startup_error = None
             for attempt in range(2):
                 try:
-                    if attempt == 1:
-                        logger.warning("[FeiShu] Retrying with SSL verification disabled...")
-                        ssl_module.create_default_context = create_unverified_context
-                        ssl_module._create_unverified_context = create_unverified_context
-
                     ws_client = ws_client_mod.Client(
                         self.feishu_app_id,
                         self.feishu_app_secret,
@@ -534,11 +521,21 @@ class FeiShuChanel(ChatChannel):
                     is_ssl_error = ("CERTIFICATE_VERIFY_FAILED" in error_msg
                                     or "certificate verify failed" in error_msg.lower())
                     if is_ssl_error and attempt == 0:
-                        logger.warning(f"[FeiShu] SSL error: {error_msg}, retrying...")
-                        continue
+                        logger.warning(f"[FeiShu] SSL error: {error_msg}, attempting to fix CA bundle...")
+                        try:
+                            from common.ssl_certs import ensure_ca_bundle
+                            ca_bundle = ensure_ca_bundle()
+                            if ca_bundle:
+                                logger.info(f"[FeiShu] CA bundle set via SSL_CERT_FILE={ca_bundle}, retrying...")
+                                continue
+                            else:
+                                logger.error("[FeiShu] No CA bundle available, cannot proceed securely")
+                        except Exception as fix_err:
+                            logger.error(f"[FeiShu] Failed to fix CA bundle: {fix_err}")
+                        startup_error = error_msg
+                        break
                     logger.error(f"[FeiShu] Websocket client error: {e}", exc_info=True)
                     startup_error = error_msg
-                    ssl_module.create_default_context = original_create_default_context
                     break
             if startup_error:
                 self.report_startup_error(startup_error)
@@ -820,18 +817,26 @@ class FeiShuChanel(ChatChannel):
             except Exception as e:
                 logger.warning(f"[FeiShu] prepare file failed: {e}")
                 # 文件下载失败时主动通知用户，避免静默丢失
-                try:
-                    err_reply = Reply(ReplyType.TEXT, f"⚠️ 文件下载失败，请重新发送：{e}")
-                    self._send(err_reply, self._compose_context(
-                        ContextType.TEXT, "",
-                        isgroup=is_group, msg=feishu_msg,
-                        receive_id_type=receive_id_type, no_need_at=True,
-                    ))
-                except Exception:
-                    pass
+                self._notify_file_download_failed(feishu_msg, is_group, receive_id_type, e)
                 return
             file_cache.add(session_id, feishu_msg.content, file_type='file')
             logger.info(f"[FeiShu] File cached for session {session_id}: {feishu_msg.content}")
+            return
+
+        # A post carrying files but no text (e.g. several files sent at once)
+        # behaves like a standalone file message: cache and wait for the query.
+        if (feishu_msg.ctype == ContextType.TEXT
+                and getattr(feishu_msg, "has_file_attachments", False)
+                and not feishu_msg.post_text):
+            for file_path, file_type in feishu_msg.attachments:
+                file_cache.add(session_id, file_path, file_type=file_type)
+            logger.info(
+                f"[FeiShu] {len(feishu_msg.attachments)} post attachment(s) cached for session {session_id}"
+            )
+            if feishu_msg.failed_files:
+                self._notify_file_download_failed(
+                    feishu_msg, is_group, receive_id_type, ", ".join(feishu_msg.failed_files)
+                )
             return
 
         # 如果是文本消息，检查是否有缓存的文件
@@ -884,6 +889,17 @@ class FeiShuChanel(ChatChannel):
             self.produce(context)
             self._message_sessions[msg_id] = (context["session_id"], context.get("agent_id"))
         logger.debug(f"[FeiShu] query={feishu_msg.content}, type={feishu_msg.ctype}")
+
+    def _notify_file_download_failed(self, feishu_msg, is_group, receive_id_type, detail):
+        try:
+            err_reply = Reply(ReplyType.TEXT, f"⚠️ 文件下载失败，请重新发送：{detail}")
+            self._send(err_reply, self._compose_context(
+                ContextType.TEXT, "",
+                isgroup=is_group, msg=feishu_msg,
+                receive_id_type=receive_id_type, no_need_at=True,
+            ))
+        except Exception:
+            pass
 
     def send(self, reply: Reply, context: Context):
         # 如果文本回复已通过流式传输发送，则跳过重复发送
